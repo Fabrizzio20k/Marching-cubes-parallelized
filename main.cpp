@@ -128,31 +128,11 @@ void draw_surface(function<double(double, double, double)> f,
 {
     MarchingCubes mc(f);
 
-    function<void(double, double, double, double, double, double)> subdivide =
-        [&](double x1, double y1, double z1, double x2, double y2, double z2)
-    {
-        if ((x2 - x1) < precision && (y2 - y1) < precision &&
-            (z2 - z1) < precision)
-        {
-            mc.addCell(x1, y1, z1, x2, y2, z2);
-            return;
-        }
+    for (double x = xmin; x < xmax; x += precision)
+        for (double y = ymin; y < ymax; y += precision)
+            for (double z = zmin; z < zmax; z += precision)
+                mc.addCell(x, y, z, x + precision, y + precision, z + precision);
 
-        double midx = (x1 + x2) / 2;
-        double midy = (y1 + y2) / 2;
-        double midz = (z1 + z2) / 2;
-
-        subdivide(x1, y1, z1, midx, midy, midz);
-        subdivide(midx, y1, z1, x2, midy, midz);
-        subdivide(x1, midy, z1, midx, y2, midz);
-        subdivide(midx, midy, z1, x2, y2, midz);
-        subdivide(x1, y1, midz, midx, midy, z2);
-        subdivide(midx, y1, midz, x2, midy, z2);
-        subdivide(x1, midy, midz, midx, y2, z2);
-        subdivide(midx, midy, midz, x2, y2, z2);
-    };
-
-    subdivide(xmin, ymin, zmin, xmax, ymax, zmax);
     mc.createPLY(output_filename);
 }
 
