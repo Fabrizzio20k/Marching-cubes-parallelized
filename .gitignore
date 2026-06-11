@@ -42,3 +42,10 @@
 
 *.ply
 marching
+build/
+.DS_Store
+graphics/.venv/
+graphics/figures/
+mc_*.out
+mc_*.err
+*.csv
