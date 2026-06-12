@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --job-name=mc512
-#SBATCH --partition=cpu
+#SBATCH --partition=standard
 #SBATCH --nodes=1
 #SBATCH --ntasks=16
 #SBATCH --cpus-per-task=1
@@ -9,8 +9,8 @@
 #SBATCH --output=mc_%j.out
 #SBATCH --error=mc_%j.err
 
-module load gcc
-module load openmpi
+module load gnu12
+module load openmpi4
 
 N=${N:-512}
 REPS=${REPS:-3}
