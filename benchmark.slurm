@@ -18,9 +18,10 @@ PROCS=${PROCS:-"1 2 4 8 16"}
 RESULTS="results_${SLURM_JOB_ID:-local}.csv"
 TMPPLY="/tmp/mc_bench_$$.ply"
 
-mkdir -p build
-g++ -O3 -std=c++17 src/sequential/main.cpp -o build/mc_seq
-mpic++ -O3 -std=c++17 src/parallelized/main.cpp -o build/mc_par
+if [ ! -x build/mc_seq ] || [ ! -x build/mc_par ]; then
+    echo "ERROR: binarios no encontrados, compila primero con ./compile.sh en el nodo de login" >&2
+    exit 1
+fi
 
 echo "version,p,N,vertices,triangulos,t_computo,t_io,t_total,t_comp_max,t_comp_min,flops,gflops" > "$RESULTS"
 
