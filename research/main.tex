@@ -1,0 +1,336 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{url}
+\usepackage{float}
+\usepackage{booktabs}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Implementación Paralela del Algoritmo Marching Cubes para Generación de Iso-superficies}
+
+\author{
+\IEEEauthorblockN{Fabrizzio Vilchez}
+\IEEEauthorblockA{
+\textit{Ciencias de la Computación} \\
+\textit{Universidad de Ingeniería y Tecnología} \\
+Lima, Perú \\
+fabrizzio.vilchez.e@utec.edu.pe \\
+Participación: 100\%}
+\and
+\IEEEauthorblockN{Alejandro Calizaya}
+\IEEEauthorblockA{
+\textit{Ciencias de la Computación} \\
+\textit{Universidad de Ingeniería y Tecnología} \\
+Lima, Perú \\
+alejandro.calizaya@utec.edu.pe \\
+Participación: 100\%}
+\and
+\IEEEauthorblockN{Adrian Auqui}
+\IEEEauthorblockA{
+\textit{Ciencias de la Computación} \\
+\textit{Universidad de Ingeniería y Tecnología} \\
+Lima, Perú \\
+adrian.auqui@utec.edu.pe \\
+Participación: 100\%}
+}
+
+\maketitle
+
+\begin{abstract}
+Este trabajo presenta el diseño, implementación y evaluación experimental de una versión paralela del algoritmo Marching Cubes para la extracción de iso-superficies a partir de campos escalares volumétricos. Partiendo de un modelo teórico CREW-PRAM, la solución se mapea a una arquitectura de memoria distribuida con MPI, repartiendo el dominio mediante \textit{Slab Decomposition} y escribiendo la malla resultante en formato PLY de manera concurrente con MPI-IO. Las pruebas se realizaron en un nodo del clúster Khipu (UTEC) con dominios de $512^3$, $768^3$ y $1024^3$ celdas y entre 1 y 32 procesos. Los resultados muestran un speedup máximo de $10.49\times$ con $p=32$ para $N=1024$, eficiencias superiores a 0.75 hasta $p=8$, y una validación empírica consistente con la complejidad teórica $O(N^3/p + \log p)$. Se identifican como límites de escalabilidad la saturación del ancho de banda de memoria a partir de $p=16$ y el desbalance de carga inherente a la partición por bloques.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Marching Cubes, MPI, computación paralela, PRAM, speedup, eficiencia, FLOPs, MPI-IO
+\end{IEEEkeywords}
+
+\section{Introducción}
+
+El algoritmo Marching Cubes, propuesto originalmente por Lorensen y Cline \cite{b1}, es una técnica fundamental para extraer superficies implícitas a partir de datos volumétricos. Dado un isovalor, el algoritmo recorre cada celda cúbica de una malla 3D, clasifica sus ocho vértices y genera los triángulos correspondientes a partir de una tabla de 256 configuraciones posibles \cite{b2}.
+
+Sus aplicaciones abarcan visualización médica, mapas topográficos y simulación de fluidos. Sin embargo, para dominios de gran resolución el costo computacional secuencial se vuelve prohibitivo: en nuestras mediciones, procesar un volumen de $1024^3$ celdas toma cerca de 36 segundos en un solo núcleo, y el crecimiento es cúbico con la resolución.
+
+La solución planteada consiste en paralelizar el algoritmo explotando la independencia espacial entre celdas: cada celda puede clasificarse e interpolarse sin conocer el resultado de sus vecinas. Se diseñó un modelo basado en PRAM, adaptado luego a memoria distribuida e implementado en C++ con \textbf{MPI}. Para evitar el cuello de botella clásico de la escritura del resultado, la consolidación del archivo PLY se realiza en paralelo con \textbf{MPI-IO}. Este informe final describe el método, el desarrollo del código en sus distintas versiones, y presenta el análisis empírico de tiempos, speedup, eficiencia y FLOPs medido sobre el clúster Khipu, contrastándolo con la complejidad teórica derivada del modelo PRAM.
+
+\section{Estado del Arte}
+
+Desde su publicación en 1987, Marching Cubes se consolidó como el método de referencia para extraer iso-superficies de volúmenes escalares. El trabajo original de Lorensen y Cline \cite{b1} ya dejaba claro que el costo es lineal en el número de celdas, y la nota técnica de Bourke \cite{b4} se volvió la guía práctica habitual para implementar la tabla de 256 casos y la interpolación de aristas; nosotros la usamos como referencia al construir y depurar nuestra propia tabla.
+
+Las mejoras posteriores al algoritmo han ido por dos frentes. El primero es la calidad de la malla: resolución de ambigüedades topológicas, recorrido jerárquico con octrees y simplificación de triángulos, líneas que el survey de Newman y Yi \cite{b2} cubre en detalle. El segundo frente es el rendimiento, con implementaciones vectorizadas en CPU, versiones en GPU que asignan hilos a celdas activas, y versiones de memoria distribuida para volúmenes que no caben en un solo nodo. En esta última línea, D'Agostino et al. \cite{b5} analizan distintas estrategias de particionamiento del dominio con MPI y muestran que, conforme crece el número de procesos, el costo de comunicación y consolidación pasa a ser el factor determinante de la escalabilidad.
+
+Nuestro trabajo se ubica precisamente ahí: una versión distribuida con partición estática por slabs, sin comunicación durante el cómputo y con escritura colectiva del resultado vía MPI-IO. Como se verá en la Sección~\ref{sec:resultados}, nuestras mediciones reproducen la observación de D'Agostino et al.: el cálculo escala bien y son los costos de coordinación y la contención de memoria los que acotan el speedup con $p$ alto.
+
+\section{Método: Diseño PRAM y Algoritmo}
+
+\subsection{Modelo PRAM y Transición a MPI}
+El algoritmo se concibe teóricamente bajo el modelo \textbf{CREW-PRAM} (Concurrent Read, Exclusive Write) \cite{b6}. En la fase de lectura, múltiples procesadores acceden concurrentemente a la definición del campo escalar; en la escritura, cada procesador genera un conjunto disjunto de triángulos, por lo que no existen conflictos de escritura. En la práctica, al emplear \textbf{MPI}, este modelo se mapea a una arquitectura SPMD (Single Program, Multiple Data). La división del dominio se realiza mediante \textit{Slab Decomposition}: el eje $Z$ se divide en bloques contiguos de $N/p$ planos, uno por proceso, lo que elimina la necesidad de comunicación durante la fase de cálculo.
+
+\subsection{Algoritmo Teórico PRAM}
+El Algoritmo~\ref{alg:pram} muestra la versión teórica, denotando con \textbf{pardo} la ejecución concurrente sobre la malla tridimensional.
+
+\begin{algorithm}[H]
+\caption{Marching Cubes Teórico (CREW PRAM)}
+\label{alg:pram}
+\renewcommand{\algorithmicdo}{}
+\begin{algorithmic}[1]
+\REQUIRE Dominio $N \times N \times N$, isolevel $\tau$, $p$ procesadores
+\ENSURE Arreglo global de triángulos $T$
+\FOR{\textbf{all} $z \in \{0, \dots, N-1\}$ \textbf{pardo}}
+    \FOR{\textbf{all} $y \in \{0, \dots, N-1\}$ \textbf{pardo}}
+        \FOR{$x = 0$ \textbf{to} $N-1$}
+            \STATE Calcular $\mathrm{idx}$ comparando 8 vértices con $\tau$
+            \IF{$\mathrm{idx} \neq 0$ \AND $\mathrm{idx} \neq 255$}
+                \STATE Generar triángulos locales en $T_{local}[x,y,z]$
+                \STATE $C_{local}[x,y,z] \leftarrow |T_{local}|$
+            \ENDIF
+        \ENDFOR
+    \ENDFOR
+\ENDFOR
+\STATE $O_{global} \leftarrow \text{Parallel\_Prefix\_Sum}(C_{local})$
+\STATE Escribir en memoria compartida $T$ usando los offsets de $O_{global}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Análisis de Complejidad Teórica}
+Definimos el tamaño del problema como el volumen total de celdas, $N^3$.
+
+\textbf{Trabajo Secuencial ($T_1$):} un único procesador recorre las $N^3$ celdas; la evaluación de los 8 vértices y la interpolación toman tiempo constante por celda, por lo que
+$$T_1 = O(N^3).$$
+
+\textbf{Tiempo Paralelo ($T_p$):} con $p$ procesadores (asumiendo $p \le N^3$), la fase de cálculo se distribuye en $O(N^3/p)$. La consolidación de offsets globales requiere una suma de prefijos paralela, con costo en árbol de $O(\log p)$:
+$$T_p = O\left(\frac{N^3}{p}\right) + O(\log p).$$
+
+\textbf{Speedup ($S_p$) y Eficiencia ($E_p$):}
+$$S_p = \frac{T_1}{T_p} = \frac{O(N^3)}{O\left(\frac{N^3}{p} + \log p\right)}, \qquad E_p = \frac{S_p}{p}.$$
+Para problemas grandes ($N^3 \gg p$) el término $\log p$ es despreciable y el speedup asintótico es lineal, $S_p \approx p$. Esta expresión es la que se valida empíricamente en la Sección~\ref{sec:resultados}.
+
+\subsection{Algoritmo Implementado con MPI y MPI-IO}
+El Algoritmo~\ref{alg:mpi} muestra la versión distribuida realmente implementada, incluyendo los puntos donde se toman las marcas de tiempo con \texttt{MPI\_Wtime()} y donde se acumulan los contadores de FLOPs.
+
+\begin{algorithm}[H]
+\caption{Marching Cubes Paralelo (MPI + MPI-IO)}
+\label{alg:mpi}
+\begin{algorithmic}[1]
+\REQUIRE Dominio $N^3$, isolevel $\tau$, $rank$, $size$
+\ENSURE Archivo PLY y métricas ($T_p$, FLOPs)
+\STATE $t_{inicio} \leftarrow \text{MPI\_Wtime}()$
+\STATE Calcular $z_{inicio}, z_{fin}$ según partición $N/size$
+\STATE $T_{local} \leftarrow \emptyset$; $F_{local} \leftarrow 0$
+\FOR{$z = z_{inicio}$ \TO $z_{fin}-1$}
+    \FOR{$y = 0$ \TO $N-1$}
+        \FOR{$x = 0$ \TO $N-1$}
+            \STATE Evaluar campo en 8 vértices y comparar con $\tau$
+            \STATE $F_{local} \leftarrow F_{local} + 8(F_{eval}+1)$
+            \IF{$\mathrm{idx} \neq 0$ \AND $\mathrm{idx} \neq 255$}
+                \STATE Interpolar aristas activas; $F_{local} \mathrel{+}= k \cdot F_{int}$
+                \STATE Agregar triángulos a $T_{local}$
+            \ENDIF
+        \ENDFOR
+    \ENDFOR
+\ENDFOR
+\STATE $C_{total} \leftarrow \text{MPI\_Allreduce}(|T_{local}|, \text{SUM})$
+\STATE $O_{local} \leftarrow \text{MPI\_Exscan}(|T_{local}|, \text{SUM})$
+\STATE Abrir archivo compartido con \texttt{MPI\_File\_open}
+\IF{$rank = 0$} \STATE Escribir cabecera PLY con $C_{total}$ \ENDIF
+\STATE $offset_v \leftarrow \text{Cabecera} + O_{local} \cdot \text{Bytes\_Vertice}$
+\STATE \texttt{MPI\_File\_write\_at\_all}($T_{local}$, $offset_v$)
+\STATE Cerrar archivo; $F_{total} \leftarrow \text{MPI\_Reduce}(F_{local}, \text{SUM})$
+\STATE $T_p \leftarrow \text{MPI\_Wtime}() - t_{inicio}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Desarrollo del Código en Versiones}
+El código se desarrolló en tres versiones registradas en el repositorio:
+
+\subsubsection{Versión 1 (secuencial)} implementación base en C++ con la tabla de 256 casos, interpolación lineal de aristas y escritura PLY. Sirve como línea base $T_1$ para todas las métricas.
+
+\subsubsection{Versión 2 (OpenMP)} primer intento de paralelización en memoria compartida con \texttt{\#pragma omp parallel for collapse(3)}. Al compartir los vectores de vértices y triángulos, fue necesario un lock global por celda activa, cuya contención limitaba la escalabilidad. Esta versión evidenció que el problema real no era el cálculo sino la consolidación del resultado, lo que motivó el cambio de paradigma.
+
+\subsubsection{Versión 3 (MPI + MPI-IO)} versión final en memoria distribuida. Cada proceso trabaja sobre su slab sin sincronización alguna durante el cómputo; los offsets globales de escritura se obtienen con \texttt{MPI\_Exscan} (la suma de prefijos del modelo PRAM) y la malla se escribe en PLY binario con \texttt{MPI\_File\_write\_at\_all}, sin condiciones de carrera. Sobre esta versión se añadieron los contadores de FLOPs y la separación de tiempos de cómputo y escritura.
+
+\subsection{Medición de FLOPs en el Código}
+Los FLOPs se contabilizan por software dentro de \texttt{processCell}: cada evaluación del campo escalar del toro cuesta $F_{eval}=10$ operaciones de punto flotante (productos, sumas y una raíz cuadrada), más una comparación contra el isovalor, aplicado a las 8 esquinas de cada celda. Cada interpolación de arista activa suma $F_{int}=15$ operaciones. Cada proceso acumula su contador local y al final se consolida con \texttt{MPI\_Reduce}. El rendimiento se reporta como $\text{GFLOPS} = F_{total} / (T_{computo} \cdot 10^9)$, excluyendo la fase de escritura, que no realiza operaciones de punto flotante.
+
+\section{Resultados y Análisis}
+\label{sec:resultados}
+
+\subsection{Entorno Experimental y Metodología}
+Las pruebas se ejecutaron en un nodo de cómputo del clúster Khipu (UTEC), con 2 sockets y 64 núcleos en total y 225~GB de RAM, usando GCC 12.4.0 con \texttt{-O3}, OpenMPI 4.1.6 y el gestor de colas SLURM. El campo escalar de prueba es la función implícita de un toro ($R=2.0$, $r=0.8$) sobre un dominio de $7 \times 7 \times 3$ unidades.
+
+Se evaluaron tres tamaños de problema, $N \in \{512, 768, 1024\}$ celdas por lado (es decir, desde $1.3\times10^8$ hasta $1.1\times10^9$ celdas), con $p \in \{1, 2, 4, 8, 16, 32\}$ procesos MPI, además de la versión secuencial pura como línea base. Cada configuración se repitió 3 veces y se reporta la mediana, para mitigar el ruido de un nodo compartido con otros trabajos. Las mallas generadas van de 1.7 a 6.8 millones de triángulos, y se verificó que el archivo PLY producido por la versión paralela es byte a byte idéntico al de la versión secuencial.
+
+\begin{table}[H]
+\caption{Resultados para $N=512$ (mediana de 3 repeticiones)}
+\label{tab:n512}
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+ & $T_{comp}$ (s) & $T_{IO}$ (s) & $T_{total}$ (s) & $S_p$ & $E_p$ & GFLOPS \\
+\midrule
+Sec.   & 4.502 & 0.056 & 4.557 & --   & --   & 2.63 \\
+$p=1$  & 5.244 & 0.063 & 5.307 & 0.86 & 0.86 & 2.26 \\
+$p=2$  & 2.695 & 0.053 & 2.748 & 1.66 & 0.83 & 4.40 \\
+$p=4$  & 1.398 & 0.069 & 1.470 & 3.10 & 0.78 & 8.48 \\
+$p=8$  & 0.765 & 0.067 & 0.832 & 5.48 & 0.68 & 15.51 \\
+$p=16$ & 0.460 & 0.075 & 0.537 & 8.49 & 0.53 & 25.79 \\
+$p=32$ & 0.446 & 0.096 & 0.533 & 8.55 & 0.27 & 26.61 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\caption{Resultados para $N=1024$ (mediana de 3 repeticiones)}
+\label{tab:n1024}
+\centering
+\begin{tabular}{lrrrrrr}
+\toprule
+ & $T_{comp}$ (s) & $T_{IO}$ (s) & $T_{total}$ (s) & $S_p$ & $E_p$ & GFLOPS \\
+\midrule
+Sec.   & 35.87 & 0.21 & 36.09 & --    & --   & 2.64 \\
+$p=1$  & 41.25 & 0.24 & 41.48 & 0.87  & 0.87 & 2.30 \\
+$p=2$  & 20.92 & 0.19 & 21.11 & 1.71  & 0.85 & 4.53 \\
+$p=4$  & 10.76 & 0.21 & 10.97 & 3.29  & 0.82 & 8.80 \\
+$p=8$  & 5.76  & 0.20 & 5.96  & 6.06  & 0.76 & 16.45 \\
+$p=16$ & 3.23  & 0.24 & 3.48  & 10.37 & 0.65 & 29.28 \\
+$p=32$ & 3.09  & 0.33 & 3.44  & 10.49 & 0.33 & 30.62 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Validación contra la Complejidad Teórica}
+El modelo predice $T_1 = O(N^3)$. Al pasar de $N=512$ a $N=768$ el volumen crece en un factor $(768/512)^3 = 3.375$, y el tiempo secuencial medido creció de 4.50~s a 15.22~s, un factor de 3.38. De $768$ a $1024$ el factor teórico es 2.37 y el medido fue 2.36. La fase de cómputo sigue, por tanto, la complejidad cúbica con un error menor al 1\%.
+
+Respecto al término $N^3/p$, la Tabla~\ref{tab:n1024} muestra que hasta $p=8$ cada duplicación de procesos reduce el tiempo de cómputo en factores de $1.97\times$, $1.94\times$ y $1.87\times$, cercanos al $2\times$ ideal. El término aditivo de coordinación ($\log p$ más el overhead del runtime) se observa directamente al comparar la versión MPI con $p=1$ contra la secuencial pura: 41.25~s frente a 35.87~s, un costo fijo de aproximadamente 15\% que se amortiza rápidamente al crecer $p$. Los FLOPs totales medidos ($1.19\times10^{10}$, $4.00\times10^{10}$ y $9.47\times10^{10}$ para los tres tamaños) son idénticos para todo $p$, lo que confirma que la paralelización reparte el trabajo sin duplicarlo.
+
+\subsection{Speedup y Eficiencia}
+Las Figuras~\ref{fig:speedup512} y~\ref{fig:speedup1024} muestran el speedup para el tamaño mínimo exigido ($N=512$) y el mayor evaluado ($N=1024$). El comportamiento es cercano al lineal hasta $p=8$ y se aplana a partir de $p=16$.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/speedup_N512}
+\caption{Speedup de cómputo y total para $N=512$.}
+\label{fig:speedup512}
+\end{figure}
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/speedup_N1024}
+\caption{Speedup de cómputo y total para $N=1024$.}
+\label{fig:speedup1024}
+\end{figure}
+
+Un resultado central del experimento es que la eficiencia mejora con el tamaño del problema: con $p=16$, $E_p$ pasa de 0.53 ($N=512$) a 0.61 ($N=768$) y 0.65 ($N=1024$), y el speedup máximo crece de $8.55\times$ a $10.09\times$ y $10.49\times$. Esto es consistente con el modelo teórico: al crecer $N^3$, el término $N^3/p$ domina sobre los costos fijos de coordinación, acercando $S_p$ al comportamiento lineal. Es el argumento clásico de escalabilidad de Gustafson: la máquina se aprovecha mejor mientras más grande es el problema.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/eficiencia_N1024}
+\caption{Eficiencia para $N=1024$.}
+\label{fig:eficiencia}
+\end{figure}
+
+\subsection{Rendimiento Computacional: FLOPs vs. $p$}
+La Figura~\ref{fig:gflops} muestra el rendimiento bruto medido con los contadores del código. Para $N=1024$ se escala de 2.3 GFLOPS con un proceso hasta 30.6 GFLOPS con 32, con la misma forma de curva que el speedup: crecimiento casi proporcional hasta $p=8$--$16$ y saturación posterior.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/gflops_N1024}
+\caption{GFLOPS medidos vs. número de procesos para $N=1024$.}
+\label{fig:gflops}
+\end{figure}
+
+\subsection{Análisis de Escalabilidad}
+La saturación entre $p=16$ y $p=32$ es el límite más visible: para $N=1024$ el tiempo de cómputo apenas baja de 3.23~s a 3.09~s al duplicar los procesos. Identificamos dos causas. La primera es el ancho de banda de memoria: el algoritmo realiza pocas operaciones por byte accedido y los 32 ranks comparten los controladores de memoria de solo 2 sockets, de modo que añadir núcleos no añade ancho de banda. La segunda es el desbalance de carga, que se analiza a continuación.
+
+La métrica de Karp-Flatt (Figura~\ref{fig:karpflatt}) confirma este diagnóstico: la fracción serial experimental se mantiene entre 0.04 y 0.07 en el rango intermedio, pero sube a 0.066 en $p=32$. Si el limitante fuera una fracción serial fija (Amdahl), $e$ permanecería constante; su crecimiento con $p$ indica overhead creciente de coordinación y contención, no código secuencial residual.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/karp_flatt_N1024}
+\caption{Fracción serial experimental (Karp-Flatt) para $N=1024$.}
+\label{fig:karpflatt}
+\end{figure}
+
+\subsection{Escalabilidad Débil}
+Aunque el barrido experimental se diseñó para escalabilidad fuerte, los datos contienen pares de configuraciones con la misma carga por proceso (mismo $N^3/p$), lo que permite una lectura de escalabilidad débil sin experimentos adicionales: al pasar de $N=512$ a $N=1024$ el volumen crece exactamente $8\times$, así que comparar $(512, p)$ contra $(1024, 8p)$ mantiene constantes las celdas por rank. En un sistema ideal el tiempo no debería cambiar ($E_{weak} = T_A/T_B = 1$). La Tabla~\ref{tab:weak} resume los tres pares disponibles.
+
+\begin{table}[H]
+\caption{Escalabilidad débil derivada de los pares con $N^3/p$ constante}
+\label{tab:weak}
+\centering
+\begin{tabular}{lccc}
+\toprule
+Celdas/proceso & Config. A & Config. B & $E_{weak}$ \\
+\midrule
+$1.3\times10^8$ & $N{=}512$, $p{=}1$ (5.31 s) & $N{=}1024$, $p{=}8$ (5.96 s) & 0.89 \\
+$6.7\times10^7$ & $N{=}512$, $p{=}2$ (2.75 s) & $N{=}1024$, $p{=}16$ (3.48 s) & 0.79 \\
+$3.4\times10^7$ & $N{=}512$, $p{=}4$ (1.47 s) & $N{=}1024$, $p{=}32$ (3.44 s) & 0.43 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Con carga gruesa la eficiencia débil se sostiene entre 0.79 y 0.89: coordinar ocho veces más procesos sobre un volumen ocho veces mayor cuesta relativamente poco, que es la situación favorable que describe la ley de Gustafson. El tercer par cae a 0.43, pero no por la granularidad en sí, sino porque su configuración B usa $p=32$, justo el régimen donde ya opera la saturación de ancho de banda descrita arriba. La conclusión práctica es que el algoritmo escala débilmente bien mientras cada rank conserve una carga suficientemente gruesa y no se cruce el límite de contención de memoria del nodo.
+
+\subsection{Balance de Carga}
+La Figura~\ref{fig:balance} muestra la relación $T_{max}/T_{min}$ entre ranks. Con pocos procesos el reparto es casi perfecto, pero llega a 1.30 con $p=16$ ($N=1024$) y a 2.29 en el caso extremo de $N=512$ con $p=32$. La causa es geométrica: el toro está centrado en $z=0$ y ocupa poco más de la mitad de la extensión vertical del dominio, de modo que los slabs centrales interpolan aristas y generan triángulos mientras los slabs de los extremos solo evalúan celdas vacías. Como el tiempo paralelo lo dicta el rank más lento, este desbalance explica buena parte de la pérdida de eficiencia con $p$ alto: con $p=32$ cada slab tiene apenas 16 planos, y la diferencia entre un slab que atraviesa el toro y uno vacío se vuelve proporcionalmente mayor.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/balance_N1024}
+\caption{Balance de carga entre ranks para $N=1024$.}
+\label{fig:balance}
+\end{figure}
+
+\subsection{Comportamiento de la Escritura con MPI-IO}
+La Figura~\ref{fig:tiempos} descompone el tiempo total. La escritura del PLY (217~MB para $N=1024$) se mantiene entre 0.19 y 0.33 segundos para todo $p$, menos del 10\% del tiempo total incluso en la configuración más paralela. La decisión de diseño de usar \texttt{MPI\_Exscan} para los offsets y \texttt{MPI\_File\_write\_at\_all} para la escritura colectiva queda validada: el I/O no es el cuello de botella del algoritmo. Se observa, eso sí, que el tiempo de escritura crece levemente con $p$ (más escritores compitiendo por el mismo sistema de archivos), por lo que en un escenario con mallas mucho mayores este término merecería atención.
+
+\begin{figure}[H]
+\centering
+\includegraphics[width=\columnwidth]{images/tiempos_N1024}
+\caption{Descomposición del tiempo en cómputo y escritura para $N=1024$.}
+\label{fig:tiempos}
+\end{figure}
+
+% Si se genera una captura del toro renderizado (MeshLab), descomentar:
+% \begin{figure}[H]
+% \centering
+% \includegraphics[width=0.8\columnwidth]{images/toro_render}
+% \caption{Iso-superficie del toro generada por la versión paralela.}
+% \label{fig:render}
+% \end{figure}
+
+\subsection{Mejoras Propuestas}
+Del análisis anterior se desprenden cuatro mejoras concretas. Primero, reemplazar la partición por bloques contiguos por una distribución cíclica de planos (el rank $i$ procesa los planos $z \equiv i \pmod p$), que repartiría las zonas activas del dominio entre todos los procesos y atacaría directamente el desbalance medido. Segundo, evitar la re-evaluación del campo escalar: cada vértice interior es compartido por hasta 8 celdas y actualmente se evalúa una vez por celda; precalcular cada plano de valores y reutilizarlo reduciría las evaluaciones en un factor cercano a 8, aliviando además la presión sobre memoria. Tercero, un esquema híbrido MPI+OpenMP (un proceso por socket, hilos dentro) reduciría el número de ranks compitiendo por ancho de banda. Por último, generar una malla indexada (deduplicando vértices compartidos entre triángulos) reduciría el tamaño del PLY a un tercio, acelerando proporcionalmente la escritura.
+
+\section{Repositorio del Proyecto}
+El código fuente (versiones secuencial y MPI), los scripts de compilación y de SLURM, los resultados crudos y el script de generación de gráficas se encuentran en: \\
+\url{https://github.com/Fabrizzio20k/Marching-cubes-parallelized}
+
+\section{Uso de Fuentes Externas y Bibliografía}
+
+Para el desarrollo de este proyecto se consultaron diversas fuentes que impactaron directamente en la estructuración de la solución:
+
+\begin{enumerate}
+    \item \textbf{Literatura Académica:} se utilizó el paper fundacional de Lorensen y Cline \cite{b1} para comprender la lógica de los 256 casos del Marching Cubes y la interpolación lineal de las aristas, complementado con la nota técnica de Bourke \cite{b4} como guía práctica de implementación de las tablas. El survey de Newman y Yi \cite{b2} y la referencia general del algoritmo \cite{b3} sirvieron para ubicar las variantes existentes. Para la parte paralela, el trabajo de D'Agostino et al. \cite{b5} orientó las decisiones de particionamiento del dominio y nos anticipó que la consolidación sería el punto crítico a medir, mientras que el texto de Blelloch \cite{b6} aportó el formalismo PRAM con el que se derivó la complejidad teórica.
+    \item \textbf{Inteligencia Artificial (LLMs):} se emplearon herramientas de IA generativa como asistentes de programación. Su impacto principal radicó en la comprensión y estructuración del paradigma \textbf{MPI-IO}: la IA fue fundamental para abstraer la matemática de desplazamientos de bytes requerida por \texttt{MPI\_Exscan} y \texttt{MPI\_File\_write\_at\_all}, permitiendo transformar una escritura secuencial lenta en un proceso concurrente sin condiciones de carrera. También se usó como apoyo para estructurar los scripts de benchmarking en SLURM y la generación de gráficas en Python, siempre validando los resultados contra ejecuciones de control (por ejemplo, verificando que los PLY secuencial y paralelo fueran idénticos y que los FLOPs totales no variaran con $p$).
+\end{enumerate}
+
+\begin{thebibliography}{00}
+\bibitem{b1} W. E. Lorensen and H. E. Cline, ``Marching Cubes: A High Resolution 3D Surface Construction Algorithm,'' \textit{ACM SIGGRAPH Computer Graphics}, vol. 21, no. 4, pp. 163-169, 1987.
+\bibitem{b2} T. S. Newman and H. Yi, ``A Survey of the Marching Cubes Algorithm,'' \textit{Computers \& Graphics}, vol. 30, no. 5, pp. 854-879, 2006.
+\bibitem{b3} Wikipedia, ``Marching cubes.'' [Online]. Available: \url{https://en.wikipedia.org/wiki/Marching_cubes}
+\bibitem{b4} P. Bourke, ``Polygonising a Scalar Field,'' technical note, 1997. [Online]. Available: \url{https://paulbourke.net/geometry/polygonise/}
+\bibitem{b5} D. D'Agostino, A. Clematis, and V. Gianuzzi, ``Parallel Isosurface Extraction for 3D Data Analysis Workflows in Distributed Environments,'' \textit{Concurrency and Computation: Practice and Experience}, vol. 23, no. 11, pp. 1284-1310, 2011.
+\bibitem{b6} G. E. Blelloch and B. M. Maggs, ``Parallel Algorithms,'' in \textit{Algorithms and Theory of Computation Handbook}, 2nd ed., CRC Press, 2010.
+\end{thebibliography}
+
+\end{document}
